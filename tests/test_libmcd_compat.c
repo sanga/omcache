@@ -123,6 +123,35 @@ static void test_libmemcached_ketama_compatibility_m(omcache_dist_t *omcache_met
   check_n_values(oc, mc, keys_omc, key_lens_omc, NULL, NULL, 1000);
   check_n_values(oc, mc, keys_mcd, key_lens_mcd, NULL, NULL, 1000);
 
+  // stop one server, see what happens
+  kill(mc_pid0, SIGSTOP);
+  usleep(100000);
+
+  // we should've found 2/3 of the values, check that we found at least half
+  size_t omc_found, mcd_found;
+  check_n_values(oc, mc, keys_all, key_lens_all, &omc_found, &mcd_found, 2000);
+  ck_assert_uint_ge(omc_found, 1000);
+  ck_assert_uint_ge(mcd_found, 1000);
+
+  // bring the node back online, see what happens now
+  kill(mc_pid0, SIGCONT);
+
+  // wait retry_timeout
+  sleep(3);
+
+  // on the first retry the clients may consider servers to be offline and fail some requests
+  check_n_values(oc, mc, keys_all, key_lens_all, &omc_found, &mcd_found, 2000);
+  ck_assert_uint_ge(omc_found, 1000);
+  ck_assert_uint_ge(mcd_found, 1000);
+
+  // wait retry_timeout
+  sleep(3);
+
+  // but now we should see all values again
+  check_n_values(oc, mc, keys_all, key_lens_all, &omc_found, &mcd_found, 2000);
+  ck_assert_uint_eq(omc_found, 2000);
+  ck_assert_uint_eq(mcd_found, 2000);
+
   for (int i = 0; i < 2000; i ++)
     free(keys_all[i]);
 
