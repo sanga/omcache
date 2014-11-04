@@ -156,6 +156,8 @@ omcache_t *omcache_init(void)
     g_iov_max = sysconf(_SC_IOV_MAX);
 
   omcache_t *mc = calloc(1, sizeof(*mc));
+  if (mc == NULL)
+    return NULL;
   mc->init_msec = omc_msec();
   mc->req_id = time(NULL);
   mc->recv_buffer_max = 1024 * (1024 + 32);
@@ -165,6 +167,11 @@ omcache_t *omcache_init(void)
   mc->dead_timeout_msec = 10 * 1000;
   mc->fd_map_max = 1024;
   mc->fd_map = malloc(mc->fd_map_max * sizeof(*mc->fd_map));
+  if (mc->fd_map == NULL)
+    {
+      free(mc);
+      return NULL;
+    }
   memset(mc->fd_map, 0xff, mc->fd_map_max * sizeof(*mc->fd_map));
   return mc;
 }
@@ -208,6 +215,7 @@ const char *omcache_strerror(int rc)
     case OMCACHE_BUFFER_FULL: return "Buffer full, command dropped";
     case OMCACHE_NO_SERVERS: return "No server available";
     case OMCACHE_SERVER_FAILURE: return "Failure communicating to server";
+    case OMCACHE_NO_MEMORY: return "Memory allocation failed";
     default: return "Unknown";
     }
 }
@@ -254,6 +262,8 @@ static omc_srv_t *omc_srv_init(const char *hostname)
 {
   const char *p;
   omc_srv_t *srv = calloc(1, sizeof(*srv));
+  if (srv == NULL)
+    return NULL;
   srv->sock = -1;
   srv->list_index = -1;
   if (*hostname == '[' && (p = strchr(hostname, ']')) != NULL)
@@ -276,6 +286,13 @@ static omc_srv_t *omc_srv_init(const char *hostname)
       // just use hostname as-is and default MC port
       srv->hostname = strdup(hostname);
       srv->port = strdup(MC_PORT);
+    }
+  if (srv->hostname == NULL || srv->port == NULL)
+    {
+      free(srv->hostname);
+      free(srv->port);
+      free(srv);
+      return NULL;
     }
   return srv;
 }
@@ -318,9 +335,13 @@ int omcache_set_servers(omcache_t *mc, const char *servers)
   omc_srv_t **srv_new = NULL;
   ssize_t srv_new_count = 0, srv_new_size = 0, srv_len;
   char *srv_dup = strdup(servers), *srv, *p;
+  int ret = OMCACHE_OK;
+
+  if (srv_dup == NULL)
+    return OMCACHE_NO_MEMORY;
 
   // parse and sort comma-delimited list of servers and strip whitespace
-  for (srv=srv_dup; srv; srv=p)
+  for (srv=srv_dup; srv && ret == OMCACHE_OK; srv=p)
     {
       p = strchr(srv, ',');
       if (p)
@@ -335,17 +356,44 @@ int omcache_set_servers(omcache_t *mc, const char *servers)
       if (srv_new_count >= srv_new_size)
         {
           srv_new_size += 16;
-          srv_new = realloc(srv_new, sizeof(*srv_new) * srv_new_size);
+          omc_srv_t **srv_a = realloc(srv_new, sizeof(*srv_new) * srv_new_size);
+          if (srv_a == NULL)
+            {
+              ret = OMCACHE_NO_MEMORY;
+              break;
+            }
+          srv_new = srv_a;
         }
       srv_new[srv_new_count++] = omc_srv_init(srv);
+      if (srv_new[srv_new_count - 1] == NULL)
+        {
+          ret = OMCACHE_NO_MEMORY;
+          break;
+        }
     }
   free(srv_dup);
+
+  if (ret != OMCACHE_OK)
+    {
+      for (ssize_t i = 0; i < srv_new_count; i ++)
+        omc_srv_free(srv_new[i]);
+      free(srv_new);
+      return ret;
+    }
 
   qsort(srv_new, srv_new_count, sizeof(*srv_new), omc_srvp_cmp);
 
   // preallocated poll-structures for all servers
   if (mc->server_count != srv_new_count)
-    mc->server_polls = realloc(mc->server_polls, srv_new_count * sizeof(*mc->server_polls));
+    {
+      struct pollfd *new_polls = realloc(mc->server_polls, srv_new_count * sizeof(*mc->server_polls));
+      if (new_polls == NULL)
+        {
+          free(srv_new);
+          return OMCACHE_NO_MEMORY;
+        }
+      mc->server_polls = new_polls;
+    }
 
   // remove old servers that weren't on the new list and add the new ones
   if (mc->server_count)
@@ -389,6 +437,19 @@ int omcache_set_servers(omcache_t *mc, const char *servers)
   // rerun distribution
   free(mc->ketama);
   mc->ketama = omc_ketama_create(mc);
+
+  // if allocation fails at this point we can't go back to the old state
+  if (mc->ketama == NULL)
+    {
+      // reset everything
+      for (ssize_t i=0; i<mc->server_count; i++)
+        omc_srv_free(mc, mc->servers[i]);
+      free(mc->servers);
+      mc->servers = NULL;
+      mc->server_count = 0;
+      return OMCACHE_NO_MEMORY;
+    }
+
   return OMCACHE_OK;
 }
 
@@ -535,6 +596,9 @@ static omc_ketama_t *omc_ketama_create(omcache_t *mc)
   size_t points_per_entry = 100;
   size_t cidx = 0, total_points = mc->server_count * points_per_entry;
   omc_ketama_t *ktm = (omc_ketama_t *) malloc(sizeof(omc_ketama_t) + total_points * sizeof(omc_ketama_point_t));
+
+  if (ktm == NULL)
+    return NULL;
 
   ktm->point_count = total_points;
   for (ssize_t i=0; i<mc->server_count; i++)
@@ -715,7 +779,13 @@ static int omc_srv_connect(omcache_t *mc, omc_srv_t *srv)
             {
               int old_max = mc->fd_map_max;
               mc->fd_map_max += 16;
-              mc->fd_map = realloc(mc->fd_map, mc->fd_map_max * sizeof(*mc->fd_map));
+              int *new_fd_map = realloc(mc->fd_map, mc->fd_map_max * sizeof(*mc->fd_map));
+              if (new_fd_map == NULL)
+                {
+                  close(sock);
+                  return OMCACHE_NO_MEMORY;
+                }
+              mc->fd_map = new_fd_map;
               memset(&mc->fd_map[old_max], 0xff, 16 * sizeof(*mc->fd_map));
             }
           mc->fd_map[sock] = srv->list_index;
@@ -803,7 +873,10 @@ static int omc_buffer_realloc(omc_buf_t *buf, size_t buf_max, uint32_t required)
       if ((size_t) (buf->end - buf->base) + required > buf_max)
         return OMCACHE_BUFFER_FULL;
       size_t new_size = min(buf_max, buffered + required + 30000);
-      buf->base = realloc(buf->base, new_size);
+      unsigned char *new_base = realloc(buf->base, new_size);
+      if (new_base == NULL)
+        return OMCACHE_NO_MEMORY;
+      buf->base = new_base;
       buf->end = buf->base + new_size;
     }
 
@@ -1288,7 +1361,10 @@ static int omc_srv_submit(omcache_t *mc, omc_srv_t *srv,
         {
           size_t buf_req = min((buf_len + msg_len) * 3 / 2, mc->send_buffer_max);
           // reallocate a larger buffer
-          srv->send_buffer.base = realloc(srv->send_buffer.base, buf_req);
+          unsigned char *new_base = realloc(srv->send_buffer.base, buf_req);
+          if (new_base == NULL)
+            return OMCACHE_NO_MEMORY;
+          srv->send_buffer.base = new_base;
           srv->send_buffer.end = srv->send_buffer.base + buf_req;
           omc_srv_debug(srv, "reallocated send buffer, now %zu bytes", buf_req);
         }
@@ -1350,9 +1426,16 @@ omcache_server_info_t *omcache_server_info(omcache_t *mc, int server_index)
     return NULL;
   omc_srv_t *srv = mc->servers[server_index];
   omcache_server_info_t *info = calloc(1, sizeof(*info));
+  if (info == NULL)
+    return NULL;
   info->omcache_version = OMCACHE_VERSION;
   info->server_index = server_index;
   info->hostname = strdup(srv->hostname);
+  if (info->hostname == NULL)
+    {
+      free(info);
+      return NULL;
+    }
   info->port = atoi(srv->port);
   return info;
 }
@@ -1460,7 +1543,15 @@ int omcache_command(omcache_t *mc,
           if (rps->size <= rps->count)
             {
               rps->size += 16;
-              rps->reqs = realloc(rps->reqs, rps->size * sizeof(omcache_req_t));
+              omcache_req_t *new_reqs = realloc(rps->reqs, rps->size * sizeof(omcache_req_t));
+              if (new_reqs == NULL)
+                {
+                  for (int si = 0; si < mc->server_count; si ++)
+                    if (reqs_per_server[si].size)
+                      free(reqs_per_server[si].reqs);
+                  return OMCACHE_NO_MEMORY;
+                }
+              rps->reqs = new_reqs;
             }
           rps->reqs[rps->count ++] = *req;
         }

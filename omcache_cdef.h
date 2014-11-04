@@ -26,6 +26,7 @@ typedef enum omcache_ret_e {
   OMCACHE_BUFFER_FULL,             ///< Buffer full, command dropped
   OMCACHE_NO_SERVERS,              ///< No server available
   OMCACHE_SERVER_FAILURE,          ///< Failure communicating to server
+  OMCACHE_NO_MEMORY,               ///< Memory allocation failed
 } omcache_ret_t;
 
 typedef struct omcache_s omcache_t;

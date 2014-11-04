@@ -30,6 +30,7 @@ START_TEST(test_strerror)
         case OMCACHE_BUFFER_FULL:
         case OMCACHE_NO_SERVERS:
         case OMCACHE_SERVER_FAILURE:
+        case OMCACHE_NO_MEMORY:
           ck_assert_int_ne(strcmp(err, "Unknown"), 0);
           break;
         default:
